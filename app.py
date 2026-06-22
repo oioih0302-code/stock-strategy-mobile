@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-모바일용 주식 전략 판단기 V1.2
+모바일용 주식 전략 판단기 V1.3
 - 자동매매가 아니라 매수/매도 의사결정 보조 앱입니다.
 - 현금/거래 기록은 사용자가 입력한 값 기준으로 계산합니다.
 - 무료 시세 데이터는 지연/누락될 수 있으므로, 실시간 매매 전에는 증권앱 현재가로 확인하세요.
@@ -814,13 +814,54 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
 def extract_numbers_from_text(text: str) -> List[float]:
     if not text:
         return []
-    pattern = r"(?<![\d.])(?:\$\s*)?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?|\d+\.\d+)(?:\s*원|\s*주|\s*USD|\s*달러)?"
+    # 0.702803주 같은 소수 수량을 702803 종목코드로 오인하지 않도록 소수/콤마 숫자를 통째로 읽는다.
+    pattern = r"(?<![\d.])(?:\$\s*)?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+|\d{4,})(?:\s*원|\s*주|\s*USD|\s*달러)?"
     values: List[float] = []
     for match in re.finditer(pattern, text):
         val = clean_number_text(match.group(0))
         if val is not None and val > 0:
             values.append(float(val))
-    # 너무 작은 OCR 잡음 제거, 순서 유지 중복 제거
+    out: List[float] = []
+    seen = set()
+    for v in values:
+        key = round(v, 6)
+        if key not in seen:
+            out.append(v)
+            seen.add(key)
+    return out
+
+
+def extract_dollar_numbers(text: str) -> List[float]:
+    """미장 캡쳐에서 $182.42, $127.95 같은 달러 숫자만 분리."""
+    if not text:
+        return []
+    pattern = r"\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)"
+    values: List[float] = []
+    for match in re.finditer(pattern, text):
+        val = clean_number_text(match.group(1))
+        if val is not None and val > 0:
+            values.append(float(val))
+    out: List[float] = []
+    seen = set()
+    for v in values:
+        key = round(v, 6)
+        if key not in seen:
+            out.append(v)
+            seen.add(key)
+    return out
+
+
+def extract_krw_numbers(text: str) -> List[float]:
+    """원/₩ 표기가 붙은 숫자만 분리. 보유현금 후보를 엉뚱한 평가금액으로 잡지 않기 위한 보조 함수."""
+    if not text:
+        return []
+    pattern = r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?)\s*원|₩\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?)"
+    values: List[float] = []
+    for match in re.finditer(pattern, text):
+        raw = match.group(1) or match.group(2)
+        val = clean_number_text(raw)
+        if val is not None and val > 0:
+            values.append(float(val))
     out: List[float] = []
     seen = set()
     for v in values:
@@ -835,8 +876,8 @@ def find_label_value(text: str, labels: Iterable[str]) -> Optional[float]:
     if not text:
         return None
     label_re = "|".join(re.escape(label) for label in labels)
-    num_re = r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?|\d+\.\d+)"
-    pattern = rf"(?:{label_re})[^\d]{{0,25}}{num_re}"
+    num_re = r"(?:\$\s*)?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,}(?:\.\d+)?|\d+\.\d+)"
+    pattern = rf"(?:{label_re})[^\d$]{{0,35}}{num_re}"
     m = re.search(pattern, text, flags=re.IGNORECASE)
     if m:
         return clean_number_text(m.group(1))
@@ -845,36 +886,58 @@ def find_label_value(text: str, labels: Iterable[str]) -> Optional[float]:
 
 def parse_ocr_text(text: str) -> Dict:
     cleaned = text or ""
-    six_digit_codes = re.findall(r"(?<!\d)(\d{6})(?!\d)", cleaned)
+    # 0.702803주에서 702803을 종목코드로 잡는 문제 방지: 앞뒤에 숫자/소수점이 없어야 6자리 코드로 인정.
+    six_digit_codes = re.findall(r"(?<![\d.])(\d{6})(?![\d.])", cleaned)
+
+    stopwords = {
+        "KRW", "USD", "ETF", "ETN", "PER", "PBR", "ROE", "EPS",
+        "OCR", "AI", "APP", "BUY", "SELL", "HOLD", "KRX", "NYSE", "NASDAQ"
+    }
     ticker_candidates = re.findall(r"\b[A-Z]{1,6}\b", cleaned)
-    ticker_candidates = [t for t in ticker_candidates if t not in {"KRW", "USD", "ETF", "ETN", "PER", "PBR", "ROE", "EPS"}]
+    ticker_candidates = [t for t in ticker_candidates if t not in stopwords]
+    # 한 글자 티커는 OCR 잡음이 많아서 뒤로 보낸다. 단, 직접 수정 가능하게 후보에는 남긴다.
+    ticker_candidates = sorted(dict.fromkeys(ticker_candidates), key=lambda t: (len(t) == 1, cleaned.find(t)))
+
+    has_dollar = "$" in cleaned or "달러" in cleaned or "프리마켓" in cleaned or "애프터" in cleaned
+    dollar_numbers = extract_dollar_numbers(cleaned)
+    krw_numbers = extract_krw_numbers(cleaned)
 
     cash = find_label_value(cleaned, ["보유현금", "예수금", "주문가능", "출금가능", "매수가능", "현금"])
     current_price = find_label_value(cleaned, ["현재가", "체결가", "주문가", "매수가", "매도가", "평균단가", "단가"])
-    qty = find_label_value(cleaned, ["수량", "보유수량", "가능수량", "주식수", "보유"])
-    total = find_label_value(cleaned, ["총액", "주문금액", "매수금액", "매도금액", "체결금액", "평가금액"])
+    qty = find_label_value(cleaned, ["보유 수량", "보유수량", "수량", "가능수량", "주식수"])
+    total = find_label_value(cleaned, ["거래 총액", "주문금액", "매수금액", "매도금액", "체결금액"])
 
     numbers = extract_numbers_from_text(cleaned)
-    # 가격 후보: 6자리 종목코드와 너무 큰 금액은 우선 제외하되 전체 후보도 같이 제공
     code_set = {float(code) for code in six_digit_codes}
-    price_candidates = []
-    cash_candidates = []
-    for v in numbers:
-        if v in code_set:
-            continue
-        if 100 <= v <= 2_000_000:
-            price_candidates.append(v)
-        if v >= 100_000:
-            cash_candidates.append(v)
 
-    if current_price is None and price_candidates:
-        # 라벨이 없으면 중간값대 숫자를 우선. 화면에 후보 목록도 보여주므로 사용자가 수정 가능.
-        current_price = price_candidates[0]
-    if cash is None and cash_candidates:
-        cash = max(cash_candidates)
+    # 시장 판정: 달러 표기가 있으면 6자리 숫자가 있어도 미장으로 우선 처리.
+    if has_dollar or (ticker_candidates and not six_digit_codes):
+        market = "US"
+    elif six_digit_codes:
+        market = "KRX"
+    else:
+        market = "KRX"
 
-    market = "KRX" if six_digit_codes else ("US" if ticker_candidates else "KRX")
-    symbol = six_digit_codes[0] if six_digit_codes else (ticker_candidates[0] if ticker_candidates else "")
+    if market == "US":
+        # 첫 번째 $ 가격은 보통 현재가다. 평가금액/투자원금도 후보로 두되 기본값은 첫 달러 가격.
+        price_candidates = [v for v in dollar_numbers if 0.01 <= v <= 10_000]
+        if current_price is None and price_candidates:
+            current_price = price_candidates[0]
+        # 미장 보유화면의 $127.95, $130.14는 현금이 아니라 평가금/원금일 가능성이 커서 현금 후보로 자동 반영하지 않는다.
+        cash_candidates = [cash] if cash is not None and cash >= 1_000 else []
+        symbol = ticker_candidates[0] if ticker_candidates else ""
+    else:
+        price_candidates = []
+        for v in numbers:
+            if v in code_set:
+                continue
+            if 100 <= v <= 2_000_000:
+                price_candidates.append(v)
+        if current_price is None and price_candidates:
+            current_price = price_candidates[0]
+        # 현금은 라벨이 확실할 때만 기본 반영. 라벨 없는 큰 숫자는 평가금액일 수 있어 자동 현금 후보에서 제외.
+        cash_candidates = [cash] if cash is not None and cash >= 1_000 else []
+        symbol = six_digit_codes[0] if six_digit_codes else ""
 
     return {
         "market": market,
@@ -1395,7 +1458,8 @@ def render_screenshot_tab() -> None:
             selected_price = clean_number_text(selected_label) or price_default
         else:
             selected_price = price_default
-        current_price = st.number_input("현재가/체결가", min_value=0.0, value=float(selected_price), step=1.0, key="ocr_current_price")
+        price_step = 1.0 if market == "KRX" else 0.01
+        current_price = st.number_input("현재가/체결가", min_value=0.0, value=float(selected_price), step=price_step, key="ocr_current_price")
 
     c3, c4 = st.columns(2)
     with c3:
